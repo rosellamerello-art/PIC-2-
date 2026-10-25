@@ -1,1 +1,370 @@
 
+#define F_CPU 8000000UL
+
+#include <avr/io.h>
+#include <avr/interrupt.h>
+#include <stdint.h>
+
+// =======================================
+// CLASIFICADOR DE PALLETS
+// ATmega328P - 8 MHz
+// =======================================
+
+// SENSORES
+// IR1   -> PB3
+// IR2   -> PC0
+// IR3   -> PC1
+// CLOCK -> PD2 (INT0)
+
+// CINTAS
+// PD3 -> Entrada 70%
+// PD4 -> Rodillos 50%
+// PD5 -> Salida 80%
+// PD7 -> Rechazo 60%
+
+// DESVIADOR
+// PD6 -> LED indicador
+// PC2 -> L293D IN1 (avance)
+// PC3 -> L293D IN2 (retroceso)
+// PC4 -> FC1 (retraido)
+// PC5 -> FC2 (extendido)
+
+#define ENTRADA   PD3
+#define RODILLOS  PD4
+#define SALIDA    PD5
+#define DESVIO    PD6
+#define RECHAZO   PD7
+
+#define AVANCE    PC2
+#define RETROCESO PC3
+#define FC1       PC4
+#define FC2       PC5
+
+#define PWM_MASK ((1 << ENTRADA) | \
+(1 << RODILLOS) | \
+(1 << SALIDA) | \
+(1 << RECHAZO))
+
+#define V_ENTRADA   70
+#define V_RODILLOS  50
+#define V_SALIDA    80
+#define V_RECHAZO   60
+
+// Limite de seguridad para cada recorrido
+#define TIMEOUT_MOTOR 15000UL
+
+volatile uint16_t pulsos = 0;
+volatile uint8_t motores = 0;
+volatile uint32_t tiempo_ms = 0;
+
+// ---------------------------------------
+// INTERRUPCION DE FRECUENCIA
+// ---------------------------------------
+ISR(INT0_vect)
+{
+	pulsos++;
+}
+
+// ---------------------------------------
+// TIMER2: PWM DE LAS CUATRO CINTAS
+// ---------------------------------------
+ISR(TIMER2_COMPA_vect)
+{
+	static uint8_t fase = 0;
+	static uint8_t divisor = 0;
+
+	uint8_t salidas = 0;
+
+	if ((motores & (1 << ENTRADA)) &&
+	fase < V_ENTRADA)
+	salidas |= (1 << ENTRADA);
+
+	if ((motores & (1 << RODILLOS)) &&
+	fase < V_RODILLOS)
+	salidas |= (1 << RODILLOS);
+
+	if ((motores & (1 << SALIDA)) &&
+	fase < V_SALIDA)
+	salidas |= (1 << SALIDA);
+
+	if ((motores & (1 << RECHAZO)) &&
+	fase < V_RECHAZO)
+	salidas |= (1 << RECHAZO);
+
+	PORTD = (PORTD & ~PWM_MASK) | salidas;
+
+	fase++;
+
+	if (fase >= 100)
+	fase = 0;
+
+	divisor++;
+
+	if (divisor >= 10)
+	{
+		divisor = 0;
+		tiempo_ms++;
+	}
+}
+
+// ---------------------------------------
+// TIEMPO DEL SISTEMA
+// ---------------------------------------
+uint32_t millis_sistema(void)
+{
+	uint32_t t;
+	uint8_t sreg = SREG;
+
+	cli();
+	t = tiempo_ms;
+	SREG = sreg;
+
+	return t;
+}
+
+// ---------------------------------------
+// MEDIR FRECUENCIA
+// ---------------------------------------
+uint16_t medir_frecuencia(void)
+{
+	uint16_t frecuencia;
+	uint32_t inicio;
+	uint8_t sreg;
+
+	sreg = SREG;
+	cli();
+	pulsos = 0;
+	SREG = sreg;
+
+	inicio = millis_sistema();
+
+	while ((uint32_t)(millis_sistema() -
+	inicio) < 1000UL)
+	{
+		// Las cintas siguen funcionando
+	}
+
+	sreg = SREG;
+	cli();
+	frecuencia = pulsos;
+	SREG = sreg;
+
+	return frecuencia;
+}
+
+// ---------------------------------------
+// CONTROL DEL MOTOR DESVIADOR
+// ---------------------------------------
+void motor_detener(void)
+{
+	PORTC &= ~((1 << AVANCE) |
+	(1 << RETROCESO));
+}
+
+void motor_avanzar(void)
+{
+	motor_detener();
+	PORTC |= (1 << AVANCE);
+}
+
+void motor_retroceder(void)
+{
+	motor_detener();
+	PORTC |= (1 << RETROCESO);
+}
+
+// ---------------------------------------
+// PROGRAMA PRINCIPAL
+// ---------------------------------------
+int main(void)
+{
+	uint8_t estado = 0;
+	uint16_t frecuencia;
+	uint32_t inicio_motor = 0;
+
+	// LED azul
+	DDRB |= (1 << PB0);
+	PORTB &= ~(1 << PB0);
+
+	// IR1
+	DDRB &= ~(1 << PB3);
+	PORTB |= (1 << PB3);
+
+	// IR2, IR3, FC1 y FC2
+	DDRC &= ~((1 << PC0) |
+	(1 << PC1) |
+	(1 << FC1) |
+	(1 << FC2));
+
+	PORTC |= (1 << PC0) |
+	(1 << PC1) |
+	(1 << FC1) |
+	(1 << FC2);
+
+	// Control del L293D
+	DDRC |= (1 << AVANCE) |
+	(1 << RETROCESO);
+
+	motor_detener();
+
+	// Cintas y LED desviador
+	DDRD |= PWM_MASK | (1 << DESVIO);
+	PORTD &= ~(PWM_MASK | (1 << DESVIO));
+
+	// CLOCK
+	DDRD &= ~(1 << PD2);
+	PORTD &= ~(1 << PD2);
+
+	// INT0
+	EICRA = (1 << ISC01) | (1 << ISC00);
+	EIFR = (1 << INTF0);
+	EIMSK = (1 << INT0);
+
+	// TIMER2 CTC
+	TCCR2A = (1 << WGM21);
+	TCCR2B = (1 << CS21);
+	OCR2A = 99;
+	TIMSK2 = (1 << OCIE2A);
+
+	sei();
+
+	while (1)
+	{
+		switch (estado)
+		{
+			case 0:
+			// ESPERA
+			motores = 0;
+			motor_detener();
+			PORTD &= ~(1 << DESVIO);
+
+			if (!(PINB & (1 << PB3)))
+			{
+				PORTB &= ~(1 << PB0);
+				motores = (1 << ENTRADA);
+				estado = 1;
+			}
+			break;
+
+			case 1:
+			// TRANSPORTE Y SENSADO
+			motores = (1 << ENTRADA) |
+			(1 << RODILLOS);
+
+			if (!(PINC & (1 << PC0)))
+			{
+				frecuencia = medir_frecuencia();
+
+				if (frecuencia >= 70 &&
+				frecuencia <= 130)
+				{
+					// AZUL
+					PORTB |= (1 << PB0);
+
+					motores = (1 << RODILLOS) |
+					(1 << SALIDA);
+
+					estado = 3;
+				}
+				else if (frecuencia >= 150 &&
+				frecuencia <= 250)
+				{
+					// ROJO
+					PORTB &= ~(1 << PB0);
+					motores = (1 << RODILLOS);
+					estado = 2;
+				}
+				else
+				{
+					// COLOR NO RECONOCIDO
+					PORTB &= ~(1 << PB0);
+					motores = 0;
+					estado = 3;
+				}
+			}
+			break;
+
+			case 2:
+			// ESPERAR PALLET ROJO EN IR3
+			if (!(PINC & (1 << PC1)))
+			{
+				motores = (1 << RECHAZO);
+				PORTD |= (1 << DESVIO);
+
+				// Comprobar posicion inicial
+				if (!(PINC & (1 << FC1)) &&
+				(PINC & (1 << FC2)))
+				{
+					motor_avanzar();
+					inicio_motor = millis_sistema();
+					estado = 4;
+				}
+				else
+				{
+					// Posicion inicial incorrecta
+					estado = 6;
+				}
+			}
+			break;
+
+			case 4:
+			// AVANZAR HASTA FC2
+			if (!(PINC & (1 << FC2)))
+			{
+				motor_detener();
+				motor_retroceder();
+
+				inicio_motor = millis_sistema();
+				estado = 5;
+			}
+			else if ((uint32_t)(
+			millis_sistema() - inicio_motor)
+			>= TIMEOUT_MOTOR)
+			{
+				estado = 6;
+			}
+			break;
+
+			case 5:
+			// RETROCEDER HASTA FC1
+			if (!(PINC & (1 << FC1)))
+			{
+				motor_detener();
+
+				PORTD &= ~(1 << DESVIO);
+				motores = 0;
+
+				estado = 3;
+			}
+			else if ((uint32_t)(
+			millis_sistema() - inicio_motor)
+			>= TIMEOUT_MOTOR)
+			{
+				estado = 6;
+			}
+			break;
+
+			case 6:
+			// ERROR DE RECORRIDO
+			// Motor y cintas detenidos
+			motor_detener();
+			motores = 0;
+			PORTD &= ~(1 << DESVIO);
+
+			// Queda detenido hasta reiniciar
+			break;
+
+			case 3:
+			// ESPERAR SENSORES LIBRES
+			if ((PINB & (1 << PB3)) &&
+			(PINC & (1 << PC0)) &&
+			(PINC & (1 << PC1)))
+			{
+				motores = 0;
+				estado = 0;
+			}
+			break;
+		}
+	}
+}
+
